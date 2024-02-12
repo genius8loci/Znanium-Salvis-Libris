@@ -1,8 +1,9 @@
 # Znanium.ru downloader (Page images into a single PDF)
+## Ideological Predecessor - [znanium-savebooks](https://github.com/luxname/znanium-savebooks "znanium-savebooks")
 
 Works on Windows, other platforms have not been tested.
 
-The script allows you to download books from the site [znanium](https://znanium.ru/). 
+The script allows you to download books from the site [znanium](https://znanium.ru/).
 For these purposes the **playwright** module is used.
 
 For downloading you need to:
@@ -18,10 +19,11 @@ The first argument is **login** from the account \
 Second argument - **password**
 
 ------------------------------------------
+## Идейный предшественник - [znanium-savebooks](https://github.com/luxname/znanium-savebooks "znanium-savebooks")
 
 Работает на Windows, остальные платформы не тестировались.
 
-Скрипт позволяет скачивать книги с сайта [znanium](https://znanium.ru/). 
+Скрипт позволяет скачивать книги с сайта [znanium](https://znanium.ru/).
 Для данных целей используется модуль **playwright**.
 
 Для скачивания вам необходимо:
