@@ -57,8 +57,8 @@ async def authCookies():
         await auth_page.goto('https://znanium.ru/user/my-profile')
 
         if auth_page.url == 'https://znanium.ru/site/login':
-            await auth_page.get_by_label('Логин или Email').fill('goodwin2283@gmail.com')
-            await auth_page.get_by_label('Пароль').fill('tsJ7#k.JQBii/8k')
+            await auth_page.get_by_label('Логин или Email').fill(LOGIN)
+            await auth_page.get_by_label('Пароль').fill(PASSWORD)
             await auth_page.get_by_role("button", name="Вход").click()
             await auth_page.wait_for_url('https://znanium.ru/user/my-profile')
             await auth_page.close()
