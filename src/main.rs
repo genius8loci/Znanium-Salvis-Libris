@@ -5,7 +5,11 @@ use anyhow::{Context, Result, anyhow};
 use base64::{Engine, engine::general_purpose::STANDARD};
 use clap::Parser;
 use image::{DynamicImage, GenericImage};
-use playwright_rs::{install_browsers, protocol::{Cookie, Page, Playwright}};
+use playwright_rs::{
+    api::LaunchOptions,
+    install_browsers,
+    protocol::{Cookie, Page, Playwright},
+};
 use quick_xml::events::Event;
 use quick_xml::reader::Reader;
 use std::collections::HashMap;
@@ -32,20 +36,27 @@ const LOGIN_URL: &str = "https://znanium.ru/site/login";
 #[tokio::main]
 async fn main() -> Result<()> {
     let args = Args::parse();
+    println!("Запуск программы. Логин: {}", args.login);
 
+    println!("Проверка и установка браузера Firefox...");
     install_browsers(Some(&["firefox"]))
         .await
         .context("не удалось установить Firefox")?;
 
+    println!("Инициализация Playwright...");
     let playwright = Playwright::launch()
         .await
         .context("не удалось запустить playwright-rs")?;
+
+    println!("Запуск Firefox (headless = false)...");
     let browser = playwright
         .firefox()
-        .launch()
+        // Выключение headless-режима через переменные окружения Playwright
+        .launch_with_options(LaunchOptions::new().headless(false))
         .await
         .context("не удалось запустить Firefox")?;
 
+    println!("Создание контекста браузера...");
     let context = browser
         .new_context()
         .await
@@ -54,17 +65,24 @@ async fn main() -> Result<()> {
     // Пустая страница, чтобы браузер не закрылся при закрытии рабочих вкладок
     let _keepalive_page = context.new_page().await?;
 
+    println!("Старт процесса авторизации...");
     auth_cookies(&context, &args.login, &args.password).await?;
 
+    println!("Чтение ссылок из файла {}...", LINKS_PATH);
     let links = read_links(LINKS_PATH)?;
+    println!("Найдено ссылок для загрузки: {}", links.len());
 
-    for link in links {
-        if let Err(err) = load_book(&context, &link).await {
+    for (i, link) in links.iter().enumerate() {
+        println!(">>> Обработка книги {} из {}: {}", i + 1, links.len(), link);
+        if let Err(err) = load_book(&context, link).await {
             eprintln!("Ошибка при обработке {link}: {err:#}");
         }
+        println!(">>> Завершена работа с книгой: {}", link);
     }
 
+    println!("Закрытие браузера...");
     browser.close().await?;
+    println!("Программа успешно завершила работу.");
     Ok(())
 }
 
@@ -87,19 +105,29 @@ async fn auth_cookies(
     password: &str,
 ) -> Result<()> {
     if let Ok(raw) = fs::read_to_string(COOKIES_PATH) {
+        println!(
+            "Найден файл {}. Подгрузка сохраненной сессии...",
+            COOKIES_PATH
+        );
         let cookies: Vec<Cookie> =
             serde_json::from_str(&raw).context("повреждённый cookies.json")?;
         context.add_cookies(&cookies).await?;
 
+        println!(
+            "Переход на страницу профиля ({}) для проверки...",
+            PROFILE_URL
+        );
         let auth_page = context.new_page().await?;
         auth_page.goto(PROFILE_URL, None).await?;
 
         if auth_page.url() == PROFILE_URL {
+            println!("Сессия действительна.");
             auth_page.close().await?;
             return Ok(());
         }
 
         if auth_page.url() == LOGIN_URL {
+            println!("Сессия истекла. Необходима повторная авторизация.");
             perform_login(&auth_page, login, password).await?;
             save_cookies(context).await?;
         }
@@ -107,6 +135,10 @@ async fn auth_cookies(
         return Ok(());
     }
 
+    println!(
+        "Файл {} не найден. Выполняется вход по логину/паролю...",
+        COOKIES_PATH
+    );
     let auth_page = context.new_page().await?;
     auth_page.goto(PROFILE_URL, None).await?;
 
@@ -120,24 +152,30 @@ async fn auth_cookies(
 
 /// Заполняет форму авторизации и дожидается перехода в личный кабинет.
 async fn perform_login(page: &Page, login: &str, password: &str) -> Result<()> {
+    println!("Заполнение поля 'Логин или Email'...");
     page.get_by_label("Логин или Email", false)
         .fill(login, None)
         .await?;
+    println!("Заполнение поля 'Пароль'...");
     page.get_by_label("Пароль", false)
         .fill(password, None)
         .await?;
+    println!("Нажатие кнопки 'Вход'...");
     page.get_by_role(
         playwright_rs::protocol::AriaRole::Button,
         Some(playwright_rs::protocol::GetByRoleOptions::default().name("Вход")),
     )
     .click(None)
     .await?;
+    println!("Ожидание редиректа в профиль...");
     page.wait_for_url(PROFILE_URL, None).await?;
+    println!("Успешная авторизация.");
     Ok(())
 }
 
 /// Сохраняет актуальные cookies контекста в файл.
 async fn save_cookies(context: &playwright_rs::protocol::BrowserContext) -> Result<()> {
+    println!("Сохранение новой сессии в {}...", COOKIES_PATH);
     let cookies = context.cookies(None).await?;
     let json = serde_json::to_string(&cookies)?;
     fs::write(COOKIES_PATH, json)?;
@@ -209,6 +247,7 @@ fn splice_slices(slices: Vec<(u32, Vec<u8>)>) -> Result<DynamicImage> {
 
 /// Загружает одну книгу: определяет число страниц, перебирает их и перехватывает XHR-ответы.
 async fn load_book(context: &playwright_rs::protocol::BrowserContext, link: &str) -> Result<()> {
+    println!("Открытие новой вкладки для загрузки книги...");
     let page = context.new_page().await?;
 
     let book_num = link
@@ -219,6 +258,7 @@ async fn load_book(context: &playwright_rs::protocol::BrowserContext, link: &str
 
     let pages_dir = PathBuf::from(format!("{book_num}_book_pages"));
     fs::create_dir_all(&pages_dir)?;
+    println!("Создана временная папка: {:?}", pages_dir);
 
     // Аккумулятор XML-ответов постранично: pgnum -> сырые байты тела ответа
     let collected: Arc<Mutex<HashMap<u32, Vec<u8>>>> = Arc::new(Mutex::new(HashMap::new()));
@@ -233,6 +273,8 @@ async fn load_book(context: &playwright_rs::protocol::BrowserContext, link: &str
                     if let Some(pg_part) = url.split("&pgnum=").nth(1) {
                         if let Ok(pgnum) = pg_part.parse::<u32>() {
                             if let Ok(body) = response.body().await {
+                                // Тихий лог, чтобы не засорять вывод, но подтверждает перехват
+                                // println!("Перехвачен XHR ответ для страницы {}", pgnum);
                                 collected.lock().await.insert(pgnum, body);
                             }
                         }
@@ -244,8 +286,10 @@ async fn load_book(context: &playwright_rs::protocol::BrowserContext, link: &str
         .await?;
     }
 
+    println!("Переход по ссылке: {}", link);
     page.goto(link, None).await?;
 
+    println!("Ожидание загрузки интерфейса читалки и количества страниц...");
     let total_pages_text = page
         .locator(
             "#body-root > div.controls > div > div > \
@@ -263,12 +307,16 @@ async fn load_book(context: &playwright_rs::protocol::BrowserContext, link: &str
         .parse()
         .unwrap_or(0);
 
+    println!("Общее количество страниц: {}", total_pages);
+
     for i in 0..total_pages {
         let page_out = pages_dir.join(format!("page_{i}.png"));
         if page_out.exists() {
+            println!("Страница {} уже загружена, пропуск.", i);
             continue;
         }
 
+        println!("Запрос страницы {}...", i);
         let input = page.locator("#page");
         input.wait_for(None).await.ok();
         input.clear(None).await.ok();
@@ -279,25 +327,34 @@ async fn load_book(context: &playwright_rs::protocol::BrowserContext, link: &str
         tokio::time::sleep(std::time::Duration::from_millis(1500)).await;
 
         if let Some(body) = collected.lock().await.remove(&i) {
+            println!("Сборка и сохранение изображения для страницы {}...", i);
             match parse_slices(&body) {
                 Ok(slices) if !slices.is_empty() => {
                     let img = splice_slices(slices)?;
                     img.save(&page_out)?;
                 }
-                _ => eprintln!("Предупреждение: не удалось собрать страницу {i} книги {book_num}"),
+                _ => {
+                    eprintln!("Предупреждение: не удалось разобрать страницу {i} книги {book_num}")
+                }
             }
+        } else {
+            println!("Таймаут или ответ для страницы {} не перехвачен.", i);
         }
     }
 
+    println!("Извлечение названия книги...");
     let book_name = page
         .locator("#body-root > div.header > div > div > div > div > p > a")
         .text_content()
         .await?
         .unwrap_or_else(|| format!("book_{book_num}"));
+    println!("Название: {}", book_name);
 
+    println!("Закрытие вкладки...");
     tokio::time::sleep(std::time::Duration::from_millis(2000)).await;
     page.close().await?;
 
+    println!("Начало формирования PDF...");
     create_pdf(&book_name, &pages_dir)?;
 
     Ok(())
@@ -307,6 +364,7 @@ async fn load_book(context: &playwright_rs::protocol::BrowserContext, link: &str
 fn create_pdf(name_book: &str, pages_dir: &Path) -> Result<()> {
     use printpdf::{ImageTransform, Mm, PdfDocument, image_crate::codecs::png::PngDecoder};
 
+    println!("Чтение загруженных страниц из {:?}...", pages_dir);
     let mut entries: Vec<PathBuf> = fs::read_dir(pages_dir)?
         .filter_map(|e| e.ok().map(|e| e.path()))
         .filter(|p| p.extension().map(|e| e == "png").unwrap_or(false))
@@ -334,6 +392,9 @@ fn create_pdf(name_book: &str, pages_dir: &Path) -> Result<()> {
     let (doc, page1, layer1) = PdfDocument::new(name_book, Mm(page_w), Mm(page_h), "Layer 1");
 
     for (idx, entry) in entries.iter().enumerate() {
+        if idx % 10 == 0 || idx == entries.len() - 1 {
+            println!("Добавление страницы {} в PDF...", idx);
+        }
         let (page_idx, layer_idx) = if idx == 0 {
             (page1, layer1)
         } else {
@@ -348,8 +409,11 @@ fn create_pdf(name_book: &str, pages_dir: &Path) -> Result<()> {
     }
 
     let out_path = PathBuf::from("All-Books").join(format!("{name_book}.pdf"));
+    println!("Запись файла PDF: {:?}", out_path);
     doc.save(&mut std::io::BufWriter::new(fs::File::create(&out_path)?))?;
 
+    println!("Удаление временной папки {:?}...", pages_dir);
     fs::remove_dir_all(pages_dir)?;
+    println!("PDF успешно создан.");
     Ok(())
 }
