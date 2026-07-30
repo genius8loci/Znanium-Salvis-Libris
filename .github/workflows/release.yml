@@ -1,0 +1,99 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+            bin: salvis
+            archive_ext: tar.gz
+
+          - os: windows-latest
+            target: x86_64-pc-windows-msvc
+            bin: salvis.exe
+            archive_ext: zip
+
+          - os: macos-latest
+            target: aarch64-apple-darwin
+            bin: salvis
+            archive_ext: tar.gz
+
+    runs-on: ${{ matrix.os }}
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.target }}
+
+      - name: Сборка релиза
+        run: cargo build --release --target ${{ matrix.target }}
+
+      # ----- Упаковка в архив (Linux / macOS) -----
+      - name: Упаковка tar.gz
+        if: matrix.archive_ext == 'tar.gz'
+        shell: bash
+        run: |
+          cd target/${{ matrix.target }}/release
+          tar -czf ../../../salvis-${{ matrix.target }}.tar.gz ${{ matrix.bin }}
+          cd -
+
+      # ----- Упаковка в архив (Windows) -----
+      - name: Упаковка zip
+        if: matrix.archive_ext == 'zip'
+        shell: pwsh
+        run: |
+          Compress-Archive -Path target/${{ matrix.target }}/release/${{ matrix.bin }} `
+            -DestinationPath salvis-${{ matrix.target }}.zip
+
+      # ----- Контрольная сумма SHA256 -----
+      - name: SHA256 (Linux/macOS)
+        if: runner.os != 'Windows'
+        run: shasum -a 256 salvis-${{ matrix.target }}.${{ matrix.archive_ext }} > salvis-${{ matrix.target }}.${{ matrix.archive_ext }}.sha256
+
+      - name: SHA256 (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $hash = Get-FileHash salvis-${{ matrix.target }}.${{ matrix.archive_ext }} -Algorithm SHA256
+          "$($hash.Hash.ToLower())  salvis-${{ matrix.target }}.${{ matrix.archive_ext }}" | Out-File -Encoding ascii salvis-${{ matrix.target }}.${{ matrix.archive_ext }}.sha256
+
+      - name: Публикация артефакта job'а
+        uses: actions/upload-artifact@v4
+        with:
+          name: salvis-${{ matrix.target }}
+          path: |
+            salvis-${{ matrix.target }}.${{ matrix.archive_ext }}
+            salvis-${{ matrix.target }}.${{ matrix.archive_ext }}.sha256
+
+  publish:
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - name: Скачивание всех артефактов
+        uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+
+      - name: Публикация в GitHub Releases
+        uses: softprops/action-gh-release@v2
+        with:
+          files: dist/*
+          generate_release_notes: true

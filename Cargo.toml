@@ -1,0 +1,28 @@
+[package]
+name = "salvis"
+version = "1.0.0"
+edition = "2024"
+description = "Znanium.ru downloader — постраничная выгрузка книги в единый PDF"
+license = "MIT"
+
+[[bin]]
+name = "salvis"
+path = "src/main.rs"
+
+[dependencies]
+playwright-rs = "0.15"
+tokio = { version = "1", features = ["full"] }
+serde_json = "1.0"
+base64 = "0.22"
+image = { version = "0.25", default-features = false, features = ["png", "jpeg"] }
+printpdf = { version = "0.7", features = ["embedded_images"] }
+anyhow = "1.0"
+quick-xml = "0.36"
+clap = { version = "4", features = ["derive"] }
+
+[profile.release]
+opt-level = 3           # Максимальная оптимизация по скорости выполнения
+lto = true              # Межпроцедурная оптимизация (Link Time Optimization)
+codegen-units = 1       # Максимально раскрывает потенциал LTO (немного замедляет сборку, но ускоряет работу программы)
+strip = true            # Удаляет отладочные символы для уменьшения размера файла
+debug = false           # Полное отключение отладочной информации
