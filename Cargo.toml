@@ -12,9 +12,13 @@ path = "src/main.rs"
 [dependencies]
 playwright-rs = "0.15"
 tokio = { version = "1", features = ["full"] }
-# Подтверждено по docs.rs/printpdf: printpdf::svg::Svg::parse(&str, &mut Vec<PdfWarnMsg>) -> Result<ExternalXObject, String>,
-# доступно за feature "svg" (тянет svg2pdf под капотом).
-printpdf = { version = "0.9", features = ["svg"] }
+# printpdf::Svg::parse убран намеренно: он прогоняет SVG через svg2pdf, а затем
+# пересобирает получившийся XObject, оставляя в его /Resources только ColorSpace.
+# Все Form XObject'ы (группы с clip-path/маской/прозрачностью — то есть весь
+# текстовый слой книги), ExtGState, Shading и Pattern при этом теряют свои имена
+# и не отрисовываются. Работаем с svg2pdf/pdf-writer напрямую.
+svg2pdf = "0.13"
+pdf-writer = "0.12"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 anyhow = "1"

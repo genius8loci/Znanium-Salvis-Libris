@@ -1,36 +1,47 @@
 // salvis — загрузчик книг с znanium.ru.
 //
-// Смена архитектуры по сравнению с вашей последней рабочей версией:
-//   - Убран перехват XHR `/read/page` и вся логика parse_slices/splice_slices.
-//     Доказано (см. переписку): сырой ответ этого эндпоинта — намеренно
-//     повреждённые данные (base64-картинка меняется при повторном запросе той
-//     же страницы; 97%+ ссылок <use> не совпадают со своими <defs>). Парсить
-//     его бессмысленно при любом количестве повторных попыток.
-//   - Вместо этого читалка сама расшифровывает данные и вставляет готовый,
-//     корректный <svg> внутрь `#bookreadcont{N}` в DOM. Мы просто дожидаемся
-//     этого и забираем `outerHTML` (подтверждено сравнением: DOM-экспорт даёт
-//     97.8-98.2% совпадения <use>/<defs>, у сырого XHR — 1.5%).
-//   - create_pdf собирал PDF из PNG через старый API printpdf (кортеж
-//     PdfDocument::new/add_page/get_layer). Новый build_pdf вставляет SVG
-//     напрямую как векторный XObject (Svg::parse + add_xobject +
-//     Op::UseXobject) — без растеризации, текст остаётся текстом.
+// Архитектура получения данных не менялась: сырой ответ XHR `/read/page` —
+// намеренно повреждённые данные, поэтому мы ждём, пока JS читалки сам
+// расшифрует страницу и вставит корректный <svg> в `#bookreadcont{N}`, и
+// забираем оттуда outerHTML.
 //
-// Всё, что касается запуска Firefox, headless(false), install_browsers,
-// new_context(), avторизации и Locator API — оставлено без изменений
-// один в один с вашим файлом, который реально скомпилировался и запустился.
-// Это подтверждено вашим компилятором, а не документацией — трогать не стал.
+// Что изменилось в сборке PDF (и почему):
+//   - Убран printpdf::Svg::parse. Внутри он вызывает svg2pdf, а потом
+//     пересобирает готовый PDF в свой XObject, записывая в его /Resources
+//     ТОЛЬКО ColorSpace. svg2pdf же кладёт каждую изолированную группу
+//     (clip-path / mask / opacity / blend-mode) в отдельный Form XObject, а
+//     прозрачность — в ExtGState. После пересборки операторы `Do` и `gs`
+//     ссылаются на имена, которых в словаре ресурсов больше нет, поэтому
+//     соответствующее содержимое просто не рисуется. В книге читалки в такие
+//     группы завёрнут весь текстовый слой — отсюда «страницы без текста,
+//     только какие-то формы и очертания» (уцелело лишь то, что лежало прямо
+//     в корневом потоке, без обёрток).
+//   - Убрано и второе следствие того же места: printpdf::Svg::parse жёстко
+//     задаёт svg2pdf dpi = 300, из-за чего готовый XObject получается
+//     размером 72/300 = 0.24 от натуральной величины, а размер страницы мы
+//     брали из viewBox как есть (1 единица = 1 pt). Отсюда «масштаб 1/10» —
+//     содержимое занимало ~24% ширины листа.
+//   - Теперь svg2pdf::to_chunk вызывается напрямую, а страница собирается
+//     через pdf-writer вместе с полным chunk'ом ресурсов. usvg::Options.dpi
+//     выставлен в 72.0, поэтому пользовательская единица SVG равна точке PDF
+//     независимо от того, записан размер как `595`, `595pt` или `210mm`.
+//
+// Всё, что касается запуска Firefox, install_browsers, new_context(),
+// авторизации и Locator API — оставлено без изменений.
 
 use anyhow::{Context, Result, anyhow};
 use clap::Parser;
+use pdf_writer::{Chunk, Content, Finish, Name, Pdf, Rect, Ref};
 use playwright_rs::{
     api::LaunchOptions,
     install_browsers,
     protocol::{Cookie, Page, Playwright},
 };
-use printpdf::{Mm, Op, PdfDocument, PdfPage, PdfSaveOptions, Svg, XObjectTransform};
+use std::collections::HashMap;
 use std::fs;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::time::Duration;
+use svg2pdf::{ConversionOptions, usvg};
 
 /// Аргументы командной строки: логин и пароль от аккаунта znanium.ru
 #[derive(Parser, Debug)]
@@ -40,12 +51,135 @@ struct Args {
     login: String,
     /// Пароль от учётной записи
     password: String,
+
+    /// Начать с указанной страницы (по умолчанию — с первой)
+    #[arg(long, value_name = "N", default_value_t = 1)]
+    from: u32,
+
+    /// Ограничить число выгружаемых страниц — для быстрой проверки результата
+    #[arg(long, value_name = "N")]
+    pages: Option<u32>,
+
+    /// Дополнительно класть рядом с каждой страницей её исходный .svg
+    #[arg(long)]
+    dump_svg: bool,
+
+    /// Не собирать общий PDF книги, ограничиться постраничными файлами
+    #[arg(long)]
+    no_merge: bool,
+
+    /// Запустить Firefox в headless-режиме
+    #[arg(long)]
+    headless: bool,
 }
 
 const COOKIES_PATH: &str = "cookies.json";
 const LINKS_PATH: &str = "links.txt";
 const PROFILE_URL: &str = "https://znanium.ru/user/my-profile";
 const LOGIN_URL: &str = "https://znanium.ru/site/login";
+/// Каталог с постраничными файлами (по подкаталогу на книгу)
+const PAGES_DIR: &str = "Pages";
+/// Каталог с собранными книгами
+const BOOKS_DIR: &str = "All-Books";
+/// Имя, под которым SVG-страница попадает в /Resources /XObject
+const SVG_NAME: Name<'static> = Name(b"S1");
+
+/// Результат извлечения страницы из DOM.
+#[derive(serde::Deserialize)]
+struct ExtractedSvg {
+    /// Самодостаточный SVG: исходная страница плюс вклеенные в неё определения.
+    svg: String,
+    /// Сколько определений пришлось подтянуть из документа.
+    added: u32,
+    /// Первые несколько id, которые не удалось найти нигде в документе.
+    missing: Vec<String>,
+    /// Полное число ненайденных id.
+    #[serde(rename = "missingCount")]
+    missing_count: u32,
+}
+
+/// Забирает страницу из DOM вместе со всем, на что она ссылается.
+///
+/// Просто `el.outerHTML` брать нельзя: читалка держит глифы шрифтов в общем
+/// хранилище за пределами самого `<svg>` страницы, а `<use xlink:href="#id">`
+/// в браузере разрешается по всему документу. В выгруженном по отдельности
+/// `<svg>` такие ссылки повисают, и весь набранный этими глифами текст
+/// исчезает — остаются только те фигуры, что нарисованы прямо в потоке
+/// (линейки, плашки, часть контуров). Замерено на реальной странице:
+/// 201 уникальная ссылка `<use>` против ровно одного `id` в самом файле.
+///
+/// Поэтому клонируем узел, транзитивно собираем все ссылки — и `href`, и
+/// `url(#...)` в любых атрибутах — и переносим найденные определения в
+/// собственный `<defs>` клона.
+const EXTRACT_SVG_JS: &str = r##"(el) => {
+  const SVG_NS = 'http://www.w3.org/2000/svg';
+  const clone = el.cloneNode(true);
+
+  let defs = null;
+  for (const child of clone.children) {
+    if (child.tagName.toLowerCase() === 'defs') { defs = child; break; }
+  }
+  if (!defs) {
+    defs = document.createElementNS(SVG_NS, 'defs');
+    clone.insertBefore(defs, clone.firstChild);
+  }
+
+  const refsOf = (root) => {
+    const out = [];
+    const stack = [root];
+    while (stack.length) {
+      const node = stack.pop();
+      if (node.attributes) {
+        for (const attr of node.attributes) {
+          const val = attr.value;
+          if (!val) continue;
+          if (attr.localName === 'href') {
+            if (val.charAt(0) === '#') out.push(val.slice(1));
+            continue;
+          }
+          const re = /url\(\s*['"]?#([^)'"\s]+)/g;
+          let m;
+          while ((m = re.exec(val)) !== null) out.push(m[1]);
+        }
+      }
+      for (const child of node.children) stack.push(child);
+    }
+    return out;
+  };
+
+  const have = new Set();
+  if (clone.id) have.add(clone.id);
+  for (const node of clone.querySelectorAll('[id]')) have.add(node.id);
+
+  const seen = new Set();
+  const missing = [];
+  let added = 0;
+  const queue = refsOf(clone);
+  while (queue.length) {
+    const id = queue.pop();
+    if (seen.has(id)) continue;
+    seen.add(id);
+    if (have.has(id)) continue;
+
+    const source = document.getElementById(id);
+    if (!source) { missing.push(id); continue; }
+
+    const copy = source.cloneNode(true);
+    defs.appendChild(copy);
+    added++;
+    have.add(id);
+    if (copy.id) have.add(copy.id);
+    for (const node of copy.querySelectorAll('[id]')) have.add(node.id);
+    for (const ref of refsOf(copy)) queue.push(ref);
+  }
+
+  return {
+    svg: clone.outerHTML,
+    added: added,
+    missing: missing.slice(0, 5),
+    missingCount: missing.length,
+  };
+}"##;
 
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -62,11 +196,10 @@ async fn main() -> Result<()> {
         .await
         .context("не удалось запустить playwright-rs")?;
 
-    println!("Запуск Firefox (headless = false)...");
+    println!("Запуск Firefox (headless = {})...", args.headless);
     let browser = playwright
         .firefox()
-        // Выключение headless-режима через переменные окружения Playwright
-        .launch_with_options(LaunchOptions::new().headless(false))
+        .launch_with_options(LaunchOptions::new().headless(args.headless))
         .await
         .context("не удалось запустить Firefox")?;
 
@@ -82,13 +215,19 @@ async fn main() -> Result<()> {
     println!("Старт процесса авторизации...");
     auth_cookies(&context, &args.login, &args.password).await?;
 
+    // Системные шрифты подгружаются один раз на весь запуск: они нужны только
+    // если в SVG встретится настоящий <text>, но перечитывать их на каждую из
+    // сотен страниц было бы непозволительно дорого.
+    println!("Подготовка конвертера SVG (загрузка системных шрифтов)...");
+    let svg_options = build_usvg_options();
+
     println!("Чтение ссылок из файла {}...", LINKS_PATH);
     let links = read_links(LINKS_PATH)?;
     println!("Найдено ссылок для загрузки: {}", links.len());
 
     for (i, link) in links.iter().enumerate() {
         println!(">>> Обработка книги {} из {}: {}", i + 1, links.len(), link);
-        if let Err(err) = process_book(&context, link).await {
+        if let Err(err) = process_book(&context, link, &args, &svg_options).await {
             eprintln!("Ошибка при обработке {link}: {err:#}");
         }
         println!(">>> Завершена работа с книгой: {}", link);
@@ -113,7 +252,6 @@ fn read_links(path: &str) -> Result<Vec<String>> {
 }
 
 /// Проверка и восстановление сессии: подгружает cookies.json либо логинится заново.
-/// Без изменений — этот блок уже подтверждён вашей рабочей сборкой.
 async fn auth_cookies(
     context: &playwright_rs::protocol::BrowserContext,
     login: &str,
@@ -166,7 +304,6 @@ async fn auth_cookies(
 }
 
 /// Заполняет форму авторизации и дожидается перехода в личный кабинет.
-/// Без изменений.
 async fn perform_login(page: &Page, login: &str, password: &str) -> Result<()> {
     println!("Заполнение поля 'Логин или Email'...");
     page.get_by_label("Логин или Email", false)
@@ -189,7 +326,7 @@ async fn perform_login(page: &Page, login: &str, password: &str) -> Result<()> {
     Ok(())
 }
 
-/// Сохраняет актуальные cookies контекста в файл. Без изменений.
+/// Сохраняет актуальные cookies контекста в файл.
 async fn save_cookies(context: &playwright_rs::protocol::BrowserContext) -> Result<()> {
     println!("Сохранение новой сессии в {}...", COOKIES_PATH);
     let cookies = context.cookies(None).await?;
@@ -198,9 +335,15 @@ async fn save_cookies(context: &playwright_rs::protocol::BrowserContext) -> Resu
     Ok(())
 }
 
-/// Загружает одну книгу: листает страницы читалки, дожидается отрисовки
-/// каждой страницы в DOM и забирает готовый <svg> из #bookreadcont{N}.
-async fn process_book(context: &playwright_rs::protocol::BrowserContext, link: &str) -> Result<()> {
+/// Загружает одну книгу: листает страницы читалки, дожидается отрисовки каждой
+/// страницы в DOM, забирает готовый <svg> из `#bookreadcont{N}` и сразу же
+/// пишет её на диск отдельным PDF — результат видно, не дожидаясь всей книги.
+async fn process_book(
+    context: &playwright_rs::protocol::BrowserContext,
+    link: &str,
+    args: &Args,
+    svg_options: &usvg::Options<'_>,
+) -> Result<()> {
     println!("Открытие новой вкладки для загрузки книги...");
     let page = context.new_page().await?;
 
@@ -233,11 +376,44 @@ async fn process_book(context: &playwright_rs::protocol::BrowserContext, link: &
         return Err(anyhow!("не удалось определить число страниц для {link}"));
     }
 
-    let mut svg_pages: Vec<String> = Vec::with_capacity(total_pages as usize);
+    // Название нужно до начала обхода: по нему именуется каталог, в который
+    // страницы складываются по мере получения.
+    println!("Извлечение названия книги...");
+    let book_name = page
+        .locator("#body-root > div.header > div > div > div > div > p > a")
+        .text_content()
+        .await
+        .ok()
+        .flatten()
+        .map(|name| name.trim().to_string())
+        .filter(|name| !name.is_empty())
+        .unwrap_or_else(|| format!("book_{book_id}"));
+    println!("Название: {}", book_name);
 
-    // Контейнеры #bookreadcontN нумеруются с 1 (подтверждено HTML-снапшотом
-    // читалки: bookreadcont1..bookreadcontN, атрибут data-pagenum совпадает).
-    for n in 1..=total_pages {
+    let safe_title = sanitize_file_name(&book_name);
+    let page_dir = PathBuf::from(PAGES_DIR).join(&safe_title);
+    fs::create_dir_all(&page_dir)
+        .with_context(|| format!("не удалось создать каталог {}", page_dir.display()))?;
+    println!("Постраничные файлы: {}", page_dir.display());
+
+    let first = args.from.max(1);
+    let last = match args.pages {
+        Some(limit) => total_pages.min(first.saturating_add(limit).saturating_sub(1)),
+        None => total_pages,
+    };
+    if first > total_pages {
+        return Err(anyhow!(
+            "--from {first} больше, чем страниц в книге ({total_pages})"
+        ));
+    }
+    if first != 1 || last != total_pages {
+        println!("Диапазон выгрузки: страницы {first}..{last}");
+    }
+
+    let mut rendered: Vec<RenderedPage> = Vec::new();
+
+    // Контейнеры #bookreadcontN нумеруются с 1, атрибут data-pagenum совпадает.
+    for n in first..=last {
         println!("Запрос страницы {}...", n);
         let input = page.locator("#page");
         input.wait_for(None).await.ok();
@@ -257,100 +433,203 @@ async fn process_book(context: &playwright_rs::protocol::BrowserContext, link: &
             }
         }
 
-        let eval_result: Result<String, _> =
-            svg_loc.evaluate("(el) => el.outerHTML", None::<()>).await;
-        match eval_result {
-            Ok(svg_html) => {
-                println!("Страница {} получена ({} байт SVG).", n, svg_html.len());
-                svg_pages.push(svg_html);
-            }
+        let extracted: ExtractedSvg = match svg_loc.evaluate(EXTRACT_SVG_JS, None::<()>).await {
+            Ok(value) => value,
             Err(err) => {
                 eprintln!("Предупреждение: не удалось извлечь SVG страницы {n}: {err:#}");
+                continue;
+            }
+        };
+        let svg_html = extracted.svg;
+        println!(
+            "Страница {} получена ({} байт SVG, вклеено определений: {}).",
+            n,
+            svg_html.len(),
+            extracted.added
+        );
+        if extracted.missing_count > 0 {
+            eprintln!(
+                "Предупреждение: на странице {n} осталось {} неразрешённых ссылок (например: {}). \
+                 Эта часть содержимого не попадёт в PDF.",
+                extracted.missing_count,
+                extracted.missing.join(", ")
+            );
+        }
+
+        if args.dump_svg {
+            let svg_path = page_dir.join(format!("page_{n:04}.svg"));
+            if let Err(err) = fs::write(&svg_path, &svg_html) {
+                eprintln!(
+                    "Предупреждение: не удалось записать {}: {err}",
+                    svg_path.display()
+                );
+            }
+        }
+
+        // Конвертация и запись отдельного PDF сразу же, а не в конце книги.
+        match render_svg(&svg_html, svg_options) {
+            Ok(rendered_page) => {
+                let pdf_path = page_dir.join(format!("page_{n:04}.pdf"));
+                let bytes = assemble_pdf(std::slice::from_ref(&rendered_page));
+                match fs::write(&pdf_path, &bytes) {
+                    Ok(()) => println!(
+                        "  -> {} ({:.1}x{:.1} pt, {} байт PDF)",
+                        pdf_path.display(),
+                        rendered_page.width_pt,
+                        rendered_page.height_pt,
+                        bytes.len()
+                    ),
+                    Err(err) => {
+                        eprintln!(
+                            "Предупреждение: не удалось записать {}: {err}",
+                            pdf_path.display()
+                        )
+                    }
+                }
+                if !args.no_merge {
+                    rendered.push(rendered_page);
+                }
+            }
+            Err(err) => {
+                eprintln!("Предупреждение: страница {n} не сконвертировалась в PDF: {err:#}");
             }
         }
     }
-
-    println!("Извлечение названия книги...");
-    let book_name = page
-        .locator("#body-root > div.header > div > div > div > div > p > a")
-        .text_content()
-        .await?
-        .unwrap_or_else(|| format!("book_{book_id}"));
-    println!("Название: {}", book_name);
 
     println!("Закрытие вкладки...");
     page.close().await?;
 
-    if svg_pages.is_empty() {
+    if args.no_merge {
+        println!("Сборка общего PDF пропущена (--no-merge).");
+        return Ok(());
+    }
+    if rendered.is_empty() {
         return Err(anyhow!("ни одна страница книги {book_id} не была получена"));
     }
 
-    println!("Начало формирования PDF...");
-    build_pdf(&book_name, &svg_pages)?;
+    println!("Начало формирования PDF из {} страниц...", rendered.len());
+    let book_file = if first == 1 && last == total_pages {
+        format!("{safe_title}.pdf")
+    } else {
+        format!("{safe_title} (стр. {first}-{last}).pdf")
+    };
+    let out_path = PathBuf::from(BOOKS_DIR).join(book_file);
+    write_pdf(&out_path, &rendered)?;
+    println!("PDF успешно создан: {}", out_path.display());
 
     Ok(())
 }
 
-/// Собирает список уже расшифрованных браузером SVG-страниц в один векторный
-/// PDF — каждая страница как вставленный XObject, без растеризации текста.
-fn build_pdf(book_title: &str, svg_pages: &[String]) -> Result<()> {
-    let mut doc = PdfDocument::new(book_title);
-    let mut warnings = Vec::new();
-    let mut pages = Vec::with_capacity(svg_pages.len());
+/// Одна сконвертированная страница: chunk со всеми объектами svg2pdf, ссылка на
+/// корневой XObject и размер страницы в точках PDF.
+struct RenderedPage {
+    chunk: Chunk,
+    root: Ref,
+    width_pt: f32,
+    height_pt: f32,
+}
 
-    for (idx, svg_str) in svg_pages.iter().enumerate() {
-        if idx % 10 == 0 || idx == svg_pages.len() - 1 {
-            println!("Добавление страницы {} в PDF...", idx + 1);
-        }
+/// Опции usvg, общие на весь запуск.
+///
+/// `dpi = 72.0` принципиально: usvg приводит размеры к пикселям через dpi, а мы
+/// затем трактуем результат как точки PDF. При 72 dpi пиксель равен точке, и
+/// страница получает верный физический размер независимо от того, записан ли
+/// размер в SVG без единиц, в `pt` или в `mm`.
+fn build_usvg_options() -> usvg::Options<'static> {
+    let mut options = usvg::Options {
+        dpi: 72.0,
+        ..usvg::Options::default()
+    };
+    options.fontdb_mut().load_system_fonts();
+    options
+}
 
-        let (w_pt, h_pt) = extract_viewbox_size(svg_str).unwrap_or((595.32, 841.92)); // запасной размер — A4 в pt
+/// Разбирает SVG страницы и конвертирует его в самодостаточный chunk PDF.
+fn render_svg(svg: &str, options: &usvg::Options<'_>) -> Result<RenderedPage> {
+    let tree = usvg::Tree::from_str(svg, options).map_err(|err| anyhow!("usvg parse: {err}"))?;
+    let size = tree.size();
 
-        let xobject = Svg::parse(svg_str, &mut warnings)
-            .map_err(|e| anyhow!("не удалось разобрать SVG страницы {}: {e}", idx + 1))?;
-        let xobject_id = doc.add_xobject(&xobject);
+    let (chunk, root) = svg2pdf::to_chunk(&tree, ConversionOptions::default())
+        .map_err(|err| anyhow!("svg2pdf: {err}"))?;
 
-        let page_mm = |pt: f32| Mm(pt * 25.4 / 72.0); // 1 pt = 25.4/72 мм
-        let ops = vec![Op::UseXobject {
-            id: xobject_id,
-            transform: XObjectTransform::default(),
-        }];
-        pages.push(PdfPage::new(page_mm(w_pt), page_mm(h_pt), ops));
+    Ok(RenderedPage {
+        chunk,
+        root,
+        width_pt: size.width(),
+        height_pt: size.height(),
+    })
+}
+
+/// Собирает многостраничный PDF: каждая страница — свой media box и свой
+/// корневой XObject из svg2pdf, вместе со всем chunk'ом его ресурсов
+/// (вложенные Form XObject'ы, ExtGState, Shading, Pattern, шрифты).
+fn assemble_pdf(pages: &[RenderedPage]) -> Vec<u8> {
+    let mut alloc = Ref::new(1);
+    let catalog_id = alloc.bump();
+    let page_tree_id = alloc.bump();
+
+    // Идентификаторы страниц нужны заранее: дерево страниц пишется до них.
+    let page_slots: Vec<(Ref, Ref)> = pages.iter().map(|_| (alloc.bump(), alloc.bump())).collect();
+
+    let mut pdf = Pdf::new();
+    pdf.catalog(catalog_id).pages(page_tree_id);
+    pdf.pages(page_tree_id)
+        .kids(page_slots.iter().map(|(page_id, _)| *page_id))
+        .count(page_slots.len() as i32);
+
+    for (rendered, (page_id, content_id)) in pages.iter().zip(page_slots) {
+        // Каждый chunk пронумерован с единицы, поэтому перед вклейкой в общий
+        // документ его объекты переносятся в сквозную нумерацию.
+        let mut map = HashMap::new();
+        let chunk = rendered
+            .chunk
+            .renumber(|old| *map.entry(old).or_insert_with(|| alloc.bump()));
+        let root = map[&rendered.root];
+
+        let mut page = pdf.page(page_id);
+        page.media_box(Rect::new(0.0, 0.0, rendered.width_pt, rendered.height_pt));
+        page.parent(page_tree_id);
+        page.contents(content_id);
+        let mut resources = page.resources();
+        resources.x_objects().pair(SVG_NAME, root);
+        resources.finish();
+        page.finish();
+
+        // to_chunk отдаёт XObject размером ровно 1x1 pt, растягиваем его на лист.
+        let mut content = Content::new();
+        content
+            .transform([rendered.width_pt, 0.0, 0.0, rendered.height_pt, 0.0, 0.0])
+            .x_object(SVG_NAME);
+        pdf.stream(content_id, &content.finish());
+
+        pdf.extend(&chunk);
     }
 
-    doc.with_pages(pages);
-    let pdf_bytes = doc.save(&PdfSaveOptions::default(), &mut warnings);
+    pdf.finish()
+}
 
-    fs::create_dir_all("All-Books")?;
-    let safe_title = book_title
+/// Пишет собранный PDF на диск, создавая недостающие каталоги.
+fn write_pdf(path: &Path, pages: &[RenderedPage]) -> Result<()> {
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)
+            .with_context(|| format!("не удалось создать каталог {}", parent.display()))?;
+    }
+    println!("Запись файла PDF: {}", path.display());
+    fs::write(path, assemble_pdf(pages))
+        .with_context(|| format!("не удалось записать {}", path.display()))?;
+    Ok(())
+}
+
+/// Заменяет запрещённые в именах файлов символы и убирает крайние пробелы/точки.
+fn sanitize_file_name(name: &str) -> String {
+    let replaced: String = name
         .chars()
         .map(|c| if "\\/:*?\"<>|".contains(c) { '_' } else { c })
-        .collect::<String>();
-    let out_path = PathBuf::from("All-Books").join(format!("{safe_title}.pdf"));
-    println!("Запись файла PDF: {:?}", out_path);
-    fs::write(&out_path, pdf_bytes)?;
-
-    if !warnings.is_empty() {
-        eprintln!(
-            "Предупреждения printpdf для «{book_title}»: {} шт.",
-            warnings.len()
-        );
-    }
-
-    println!("PDF успешно создан.");
-    Ok(())
-}
-
-/// Извлекает ширину/высоту из атрибута viewBox="minX minY width height" (в pt).
-fn extract_viewbox_size(svg: &str) -> Option<(f32, f32)> {
-    let start = svg.find("viewBox=\"")? + "viewBox=\"".len();
-    let end = svg[start..].find('"')? + start;
-    let parts: Vec<f32> = svg[start..end]
-        .split_whitespace()
-        .filter_map(|s| s.parse().ok())
         .collect();
-    if parts.len() == 4 {
-        Some((parts[2], parts[3]))
+    let trimmed = replaced.trim().trim_end_matches('.').trim();
+    if trimmed.is_empty() {
+        "book".to_string()
     } else {
-        None
+        trimmed.to_string()
     }
 }
