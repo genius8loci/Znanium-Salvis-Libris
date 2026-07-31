@@ -1,8 +1,8 @@
 [package]
 name = "salvis"
-version = "1.0.0"
+version = "1.1.0"
 edition = "2024"
-description = "Znanium.ru downloader — постраничная выгрузка книги в единый PDF"
+description = "Znanium.ru downloader — выгрузка книги в векторный PDF из отрисованных DOM-SVG страниц"
 license = "MIT"
 
 [[bin]]
@@ -12,12 +12,12 @@ path = "src/main.rs"
 [dependencies]
 playwright-rs = "0.15"
 tokio = { version = "1", features = ["full"] }
-serde_json = "1.0"
-base64 = "0.22"
-image = { version = "0.25", default-features = false, features = ["png", "jpeg"] }
-printpdf = { version = "0.7", features = ["embedded_images"] }
-anyhow = "1.0"
-quick-xml = "0.36"
+# Подтверждено по docs.rs/printpdf: printpdf::svg::Svg::parse(&str, &mut Vec<PdfWarnMsg>) -> Result<ExternalXObject, String>,
+# доступно за feature "svg" (тянет svg2pdf под капотом).
+printpdf = { version = "0.9", features = ["svg"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+anyhow = "1"
 clap = { version = "4", features = ["derive"] }
 
 [profile.release]

@@ -1,22 +1,36 @@
-// salvis — загрузчик книг с znanium.ru, портированный с Python (salvis.py) на Rust.
-// Использует playwright-rs 0.15 для управления headless-браузером.
+// salvis — загрузчик книг с znanium.ru.
+//
+// Смена архитектуры по сравнению с вашей последней рабочей версией:
+//   - Убран перехват XHR `/read/page` и вся логика parse_slices/splice_slices.
+//     Доказано (см. переписку): сырой ответ этого эндпоинта — намеренно
+//     повреждённые данные (base64-картинка меняется при повторном запросе той
+//     же страницы; 97%+ ссылок <use> не совпадают со своими <defs>). Парсить
+//     его бессмысленно при любом количестве повторных попыток.
+//   - Вместо этого читалка сама расшифровывает данные и вставляет готовый,
+//     корректный <svg> внутрь `#bookreadcont{N}` в DOM. Мы просто дожидаемся
+//     этого и забираем `outerHTML` (подтверждено сравнением: DOM-экспорт даёт
+//     97.8-98.2% совпадения <use>/<defs>, у сырого XHR — 1.5%).
+//   - create_pdf собирал PDF из PNG через старый API printpdf (кортеж
+//     PdfDocument::new/add_page/get_layer). Новый build_pdf вставляет SVG
+//     напрямую как векторный XObject (Svg::parse + add_xobject +
+//     Op::UseXobject) — без растеризации, текст остаётся текстом.
+//
+// Всё, что касается запуска Firefox, headless(false), install_browsers,
+// new_context(), avторизации и Locator API — оставлено без изменений
+// один в один с вашим файлом, который реально скомпилировался и запустился.
+// Это подтверждено вашим компилятором, а не документацией — трогать не стал.
 
 use anyhow::{Context, Result, anyhow};
-use base64::{Engine, engine::general_purpose::STANDARD};
 use clap::Parser;
-use image::{DynamicImage, GenericImage};
 use playwright_rs::{
     api::LaunchOptions,
     install_browsers,
     protocol::{Cookie, Page, Playwright},
 };
-use quick_xml::events::Event;
-use quick_xml::reader::Reader;
-use std::collections::HashMap;
+use printpdf::{Mm, Op, PdfDocument, PdfPage, PdfSaveOptions, Svg, XObjectTransform};
 use std::fs;
-use std::path::{Path, PathBuf};
-use std::sync::Arc;
-use tokio::sync::Mutex;
+use std::path::PathBuf;
+use std::time::Duration;
 
 /// Аргументы командной строки: логин и пароль от аккаунта znanium.ru
 #[derive(Parser, Debug)]
@@ -74,7 +88,7 @@ async fn main() -> Result<()> {
 
     for (i, link) in links.iter().enumerate() {
         println!(">>> Обработка книги {} из {}: {}", i + 1, links.len(), link);
-        if let Err(err) = load_book(&context, link).await {
+        if let Err(err) = process_book(&context, link).await {
             eprintln!("Ошибка при обработке {link}: {err:#}");
         }
         println!(">>> Завершена работа с книгой: {}", link);
@@ -99,6 +113,7 @@ fn read_links(path: &str) -> Result<Vec<String>> {
 }
 
 /// Проверка и восстановление сессии: подгружает cookies.json либо логинится заново.
+/// Без изменений — этот блок уже подтверждён вашей рабочей сборкой.
 async fn auth_cookies(
     context: &playwright_rs::protocol::BrowserContext,
     login: &str,
@@ -151,6 +166,7 @@ async fn auth_cookies(
 }
 
 /// Заполняет форму авторизации и дожидается перехода в личный кабинет.
+/// Без изменений.
 async fn perform_login(page: &Page, login: &str, password: &str) -> Result<()> {
     println!("Заполнение поля 'Логин или Email'...");
     page.get_by_label("Логин или Email", false)
@@ -173,7 +189,7 @@ async fn perform_login(page: &Page, login: &str, password: &str) -> Result<()> {
     Ok(())
 }
 
-/// Сохраняет актуальные cookies контекста в файл.
+/// Сохраняет актуальные cookies контекста в файл. Без изменений.
 async fn save_cookies(context: &playwright_rs::protocol::BrowserContext) -> Result<()> {
     println!("Сохранение новой сессии в {}...", COOKIES_PATH);
     let cookies = context.cookies(None).await?;
@@ -182,124 +198,29 @@ async fn save_cookies(context: &playwright_rs::protocol::BrowserContext) -> Resu
     Ok(())
 }
 
-/// Разбирает XML-ответ вида <bookpages><sliceN>data:image/png;base64,...</sliceN>...</bookpages>
-/// и возвращает срезы страницы в порядке их номеров.
-fn parse_slices(xml_bytes: &[u8]) -> Result<Vec<(u32, Vec<u8>)>> {
-    let mut reader = Reader::from_reader(xml_bytes);
-    reader.config_mut().trim_text(true);
-
-    let mut slices = Vec::new();
-    let mut current_tag: Option<String> = None;
-    let mut buf = Vec::new();
-
-    loop {
-        match reader.read_event_into(&mut buf) {
-            Ok(Event::Start(e)) => {
-                let tag = String::from_utf8_lossy(e.name().as_ref()).to_string();
-                if tag.starts_with("slice") {
-                    current_tag = Some(tag);
-                }
-            }
-            Ok(Event::Text(e)) => {
-                if let Some(tag) = &current_tag {
-                    let text = e.unescape()?.into_owned();
-                    if let Some(idx) = text.find("base64,") {
-                        let b64 = &text[idx + "base64,".len()..];
-                        let bytes = STANDARD.decode(b64.trim())?;
-                        let n: u32 = tag.trim_start_matches("slice").parse().unwrap_or(0);
-                        slices.push((n, bytes));
-                    }
-                }
-            }
-            Ok(Event::End(_)) => current_tag = None,
-            Ok(Event::Eof) => break,
-            Err(e) => return Err(anyhow!("ошибка разбора XML: {e}")),
-            _ => {}
-        }
-        buf.clear();
-    }
-
-    slices.sort_by_key(|(n, _)| *n);
-    Ok(slices)
-}
-
-/// Склеивает вертикально набор изображений-кусочков в одну страницу.
-fn splice_slices(slices: Vec<(u32, Vec<u8>)>) -> Result<DynamicImage> {
-    let images: Vec<DynamicImage> = slices
-        .into_iter()
-        .map(|(_, bytes)| {
-            image::load_from_memory(&bytes).context("не удалось декодировать срез страницы")
-        })
-        .collect::<Result<Vec<_>>>()?;
-
-    let max_width = images.iter().map(|img| img.width()).max().unwrap_or(0);
-    let total_height: u32 = images.iter().map(|img| img.height()).sum();
-
-    let mut canvas = DynamicImage::new_rgb8(max_width, total_height);
-    let mut y_offset = 0u32;
-    for img in &images {
-        canvas.copy_from(img, 0, y_offset)?;
-        y_offset += img.height();
-    }
-
-    Ok(canvas)
-}
-
-/// Загружает одну книгу: определяет число страниц, перебирает их и перехватывает XHR-ответы.
-async fn load_book(context: &playwright_rs::protocol::BrowserContext, link: &str) -> Result<()> {
+/// Загружает одну книгу: листает страницы читалки, дожидается отрисовки
+/// каждой страницы в DOM и забирает готовый <svg> из #bookreadcont{N}.
+async fn process_book(context: &playwright_rs::protocol::BrowserContext, link: &str) -> Result<()> {
     println!("Открытие новой вкладки для загрузки книги...");
     let page = context.new_page().await?;
 
-    let book_num = link
+    let book_id = link
         .split('=')
         .nth(1)
-        .ok_or_else(|| anyhow!("не удалось извлечь номер книги из ссылки: {link}"))?
+        .ok_or_else(|| anyhow!("не удалось извлечь id книги из ссылки: {link}"))?
         .to_string();
-
-    let pages_dir = PathBuf::from(format!("{book_num}_book_pages"));
-    fs::create_dir_all(&pages_dir)?;
-    println!("Создана временная папка: {:?}", pages_dir);
-
-    // Аккумулятор XML-ответов постранично: pgnum -> сырые байты тела ответа
-    let collected: Arc<Mutex<HashMap<u32, Vec<u8>>>> = Arc::new(Mutex::new(HashMap::new()));
-
-    {
-        let collected = collected.clone();
-        page.on_response(move |response| {
-            let collected = collected.clone();
-            async move {
-                let url = response.url().to_string();
-                if url.contains("pgnum") {
-                    if let Some(pg_part) = url.split("&pgnum=").nth(1) {
-                        if let Ok(pgnum) = pg_part.parse::<u32>() {
-                            if let Ok(body) = response.body().await {
-                                // Тихий лог, чтобы не засорять вывод, но подтверждает перехват
-                                // println!("Перехвачен XHR ответ для страницы {}", pgnum);
-                                collected.lock().await.insert(pgnum, body);
-                            }
-                        }
-                    }
-                }
-                Ok(())
-            }
-        })
-        .await?;
-    }
 
     println!("Переход по ссылке: {}", link);
     page.goto(link, None).await?;
 
     println!("Ожидание загрузки интерфейса читалки и количества страниц...");
-    let total_pages_text = page
-        .locator(
-            "#body-root > div.controls > div > div > \
-             div.controls__control-panel.control-panel.flex > \
-             div.control-panel__pages.pages.flex > p",
-        )
-        .text_content()
-        .await?
-        .unwrap_or_default();
-
+    let total_pages_loc = page.locator(
+        "#body-root > div.controls > div > div > \
+         div.controls__control-panel.control-panel.flex > \
+         div.control-panel__pages.pages.flex > p",
+    );
+    total_pages_loc.wait_for(None).await.ok();
+    let total_pages_text = total_pages_loc.text_content().await?.unwrap_or_default();
     let total_pages: u32 = total_pages_text
         .chars()
         .filter(|c| c.is_ascii_digit())
@@ -308,37 +229,44 @@ async fn load_book(context: &playwright_rs::protocol::BrowserContext, link: &str
         .unwrap_or(0);
 
     println!("Общее количество страниц: {}", total_pages);
+    if total_pages == 0 {
+        return Err(anyhow!("не удалось определить число страниц для {link}"));
+    }
 
-    for i in 0..total_pages {
-        let page_out = pages_dir.join(format!("page_{i}.png"));
-        if page_out.exists() {
-            println!("Страница {} уже загружена, пропуск.", i);
-            continue;
-        }
+    let mut svg_pages: Vec<String> = Vec::with_capacity(total_pages as usize);
 
-        println!("Запрос страницы {}...", i);
+    // Контейнеры #bookreadcontN нумеруются с 1 (подтверждено HTML-снапшотом
+    // читалки: bookreadcont1..bookreadcontN, атрибут data-pagenum совпадает).
+    for n in 1..=total_pages {
+        println!("Запрос страницы {}...", n);
         let input = page.locator("#page");
         input.wait_for(None).await.ok();
         input.clear(None).await.ok();
-        input.fill(&i.to_string(), None).await.ok();
+        input.fill(&n.to_string(), None).await.ok();
         input.press("Enter", None).await.ok();
 
-        // Ждём поступления ответа с pgnum и небольшую паузу на дозагрузку срезов
-        tokio::time::sleep(std::time::Duration::from_millis(1500)).await;
+        let svg_loc = page.locator(&format!("#bookreadcont{n} svg"));
 
-        if let Some(body) = collected.lock().await.remove(&i) {
-            println!("Сборка и сохранение изображения для страницы {}...", i);
-            match parse_slices(&body) {
-                Ok(slices) if !slices.is_empty() => {
-                    let img = splice_slices(slices)?;
-                    img.save(&page_out)?;
-                }
-                _ => {
-                    eprintln!("Предупреждение: не удалось разобрать страницу {i} книги {book_num}")
-                }
+        match tokio::time::timeout(Duration::from_secs(15), svg_loc.wait_for(None)).await {
+            Ok(Ok(())) => {}
+            _ => {
+                eprintln!(
+                    "Предупреждение: страница {n} книги {book_id} не отрисовалась за 15с, пропуск"
+                );
+                continue;
             }
-        } else {
-            println!("Таймаут или ответ для страницы {} не перехвачен.", i);
+        }
+
+        let eval_result: Result<String, _> =
+            svg_loc.evaluate("(el) => el.outerHTML", None::<()>).await;
+        match eval_result {
+            Ok(svg_html) => {
+                println!("Страница {} получена ({} байт SVG).", n, svg_html.len());
+                svg_pages.push(svg_html);
+            }
+            Err(err) => {
+                eprintln!("Предупреждение: не удалось извлечь SVG страницы {n}: {err:#}");
+            }
         }
     }
 
@@ -347,73 +275,82 @@ async fn load_book(context: &playwright_rs::protocol::BrowserContext, link: &str
         .locator("#body-root > div.header > div > div > div > div > p > a")
         .text_content()
         .await?
-        .unwrap_or_else(|| format!("book_{book_num}"));
+        .unwrap_or_else(|| format!("book_{book_id}"));
     println!("Название: {}", book_name);
 
     println!("Закрытие вкладки...");
-    tokio::time::sleep(std::time::Duration::from_millis(2000)).await;
     page.close().await?;
 
+    if svg_pages.is_empty() {
+        return Err(anyhow!("ни одна страница книги {book_id} не была получена"));
+    }
+
     println!("Начало формирования PDF...");
-    create_pdf(&book_name, &pages_dir)?;
+    build_pdf(&book_name, &svg_pages)?;
 
     Ok(())
 }
 
-/// Собирает все PNG-страницы из временной папки в один PDF-файл и удаляет папку.
-fn create_pdf(name_book: &str, pages_dir: &Path) -> Result<()> {
-    use printpdf::{ImageTransform, Mm, PdfDocument, image_crate::codecs::png::PngDecoder};
+/// Собирает список уже расшифрованных браузером SVG-страниц в один векторный
+/// PDF — каждая страница как вставленный XObject, без растеризации текста.
+fn build_pdf(book_title: &str, svg_pages: &[String]) -> Result<()> {
+    let mut doc = PdfDocument::new(book_title);
+    let mut warnings = Vec::new();
+    let mut pages = Vec::with_capacity(svg_pages.len());
 
-    println!("Чтение загруженных страниц из {:?}...", pages_dir);
-    let mut entries: Vec<PathBuf> = fs::read_dir(pages_dir)?
-        .filter_map(|e| e.ok().map(|e| e.path()))
-        .filter(|p| p.extension().map(|e| e == "png").unwrap_or(false))
-        .collect();
-    entries.sort_by_key(|p| {
-        p.file_stem()
-            .and_then(|s| s.to_str())
-            .and_then(|s| s.trim_start_matches("page_").parse::<u32>().ok())
-            .unwrap_or(0)
-    });
+    for (idx, svg_str) in svg_pages.iter().enumerate() {
+        if idx % 10 == 0 || idx == svg_pages.len() - 1 {
+            println!("Добавление страницы {} в PDF...", idx + 1);
+        }
 
-    if entries.is_empty() {
-        return Err(anyhow!(
-            "нет страниц для сборки PDF: {}",
-            pages_dir.display()
-        ));
+        let (w_pt, h_pt) = extract_viewbox_size(svg_str).unwrap_or((595.32, 841.92)); // запасной размер — A4 в pt
+
+        let xobject = Svg::parse(svg_str, &mut warnings)
+            .map_err(|e| anyhow!("не удалось разобрать SVG страницы {}: {e}", idx + 1))?;
+        let xobject_id = doc.add_xobject(&xobject);
+
+        let page_mm = |pt: f32| Mm(pt * 25.4 / 72.0); // 1 pt = 25.4/72 мм
+        let ops = vec![Op::UseXobject {
+            id: xobject_id,
+            transform: XObjectTransform::default(),
+        }];
+        pages.push(PdfPage::new(page_mm(w_pt), page_mm(h_pt), ops));
     }
+
+    doc.with_pages(pages);
+    let pdf_bytes = doc.save(&PdfSaveOptions::default(), &mut warnings);
 
     fs::create_dir_all("All-Books")?;
+    let safe_title = book_title
+        .chars()
+        .map(|c| if "\\/:*?\"<>|".contains(c) { '_' } else { c })
+        .collect::<String>();
+    let out_path = PathBuf::from("All-Books").join(format!("{safe_title}.pdf"));
+    println!("Запись файла PDF: {:?}", out_path);
+    fs::write(&out_path, pdf_bytes)?;
 
-    let first = image::open(&entries[0])?;
-    let (w_px, h_px) = (first.width() as f32, first.height() as f32);
-    let (page_w, page_h) = (w_px * 25.4 / 96.0, h_px * 25.4 / 96.0);
-
-    let (doc, page1, layer1) = PdfDocument::new(name_book, Mm(page_w), Mm(page_h), "Layer 1");
-
-    for (idx, entry) in entries.iter().enumerate() {
-        if idx % 10 == 0 || idx == entries.len() - 1 {
-            println!("Добавление страницы {} в PDF...", idx);
-        }
-        let (page_idx, layer_idx) = if idx == 0 {
-            (page1, layer1)
-        } else {
-            doc.add_page(Mm(page_w), Mm(page_h), "Layer 1")
-        };
-        let layer = doc.get_page(page_idx).get_layer(layer_idx);
-
-        let file = fs::File::open(entry)?;
-        let decoder = PngDecoder::new(file)?;
-        let img = printpdf::Image::try_from(decoder)?;
-        img.add_to_layer(layer, ImageTransform::default());
+    if !warnings.is_empty() {
+        eprintln!(
+            "Предупреждения printpdf для «{book_title}»: {} шт.",
+            warnings.len()
+        );
     }
 
-    let out_path = PathBuf::from("All-Books").join(format!("{name_book}.pdf"));
-    println!("Запись файла PDF: {:?}", out_path);
-    doc.save(&mut std::io::BufWriter::new(fs::File::create(&out_path)?))?;
-
-    println!("Удаление временной папки {:?}...", pages_dir);
-    fs::remove_dir_all(pages_dir)?;
     println!("PDF успешно создан.");
     Ok(())
+}
+
+/// Извлекает ширину/высоту из атрибута viewBox="minX minY width height" (в pt).
+fn extract_viewbox_size(svg: &str) -> Option<(f32, f32)> {
+    let start = svg.find("viewBox=\"")? + "viewBox=\"".len();
+    let end = svg[start..].find('"')? + start;
+    let parts: Vec<f32> = svg[start..end]
+        .split_whitespace()
+        .filter_map(|s| s.parse().ok())
+        .collect();
+    if parts.len() == 4 {
+        Some((parts[2], parts[3]))
+    } else {
+        None
+    }
 }
